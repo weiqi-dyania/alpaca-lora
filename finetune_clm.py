@@ -28,7 +28,8 @@ from utils.prompter import Prompter
 def train(
     # model/data params
     base_model: str = "",  # the only required argument
-    data_path: str = "yahma/alpaca-cleaned",
+    train_data_path: str = "",
+    dev_data_path: str = "",
     output_dir: str = "./lora-alpaca",
     # training hyperparams
     batch_size: int = 128,
@@ -36,14 +37,16 @@ def train(
     num_epochs: int = 3,
     learning_rate: float = 3e-4,
     cutoff_len: int = 256,
-    val_set_size: int = 2000,
+    #val_set_size: int = 2000,
     # lora hyperparams
     lora_r: int = 8,
     lora_alpha: int = 16,
     lora_dropout: float = 0.05,
     lora_target_modules: List[str] = [
         "q_proj",
+        "k_proj",
         "v_proj",
+        "o_proj",
     ],
     # llm hyperparams
     train_on_inputs: bool = False,  # if False, masks out inputs in loss
@@ -60,14 +63,15 @@ def train(
         print(
             f"Training Alpaca-LoRA model with params:\n"
             f"base_model: {base_model}\n"
-            f"data_path: {data_path}\n"
+            f"train_data_path: {train_data_path}\n"
+            f"dev_data_path: {dev_data_path}\n"
             f"output_dir: {output_dir}\n"
             f"batch_size: {batch_size}\n"
             f"micro_batch_size: {micro_batch_size}\n"
             f"num_epochs: {num_epochs}\n"
             f"learning_rate: {learning_rate}\n"
             f"cutoff_len: {cutoff_len}\n"
-            f"val_set_size: {val_set_size}\n"
+            #f"val_set_size: {val_set_size}\n"
             f"lora_r: {lora_r}\n"
             f"lora_alpha: {lora_alpha}\n"
             f"lora_dropout: {lora_dropout}\n"
@@ -86,8 +90,6 @@ def train(
     ), "Please specify a --base_model, e.g. --base_model='decapoda-research/llama-7b-hf'"
     gradient_accumulation_steps = batch_size // micro_batch_size
 
-    prompter = Prompter(prompt_template_name)
-
     device_map = "auto"
     world_size = int(os.environ.get("WORLD_SIZE", 1))
     ddp = world_size != 1
@@ -95,17 +97,57 @@ def train(
         device_map = {"": int(os.environ.get("LOCAL_RANK") or 0)}
         gradient_accumulation_steps = gradient_accumulation_steps // world_size
 
-    # Check if parameter passed or if set within environ
-    use_wandb = len(wandb_project) > 0 or (
-        "WANDB_PROJECT" in os.environ and len(os.environ["WANDB_PROJECT"]) > 0
+    tokenizer_kwargs = {
+        "model_max_length": cutoff_len,
+        "padding_side": "left",
+        "use_fast": False,
+    }
+    tokenizer = LlamaTokenizer.from_pretrained(base_model, **tokenizer_kwargs)
+    tokenizer.pad_token_id = (
+        0  # unk. we want this to be different from the eos token
     )
-    # Only overwrite environ if wandb param passed
-    if len(wandb_project) > 0:
-        os.environ["WANDB_PROJECT"] = wandb_project
-    if len(wandb_watch) > 0:
-        os.environ["WANDB_WATCH"] = wandb_watch
-    if len(wandb_log_model) > 0:
-        os.environ["WANDB_LOG_MODEL"] = wandb_log_model
+
+
+    raw_datasets = load_dataset('json', data_files={"train": train_data_path, "validation": dev_data_path})
+
+    # Preprocessing the datasets.
+    column_names = raw_datasets["train"].column_names
+
+    # prepare the tokenize function to tokenize and concatenate prompt and completion
+    def tokenize_function(examples):
+        # tokenize prompt and completion separately
+        prompt_tokens = tokenizer(examples['prompt'])
+        completion_tokens = tokenizer(examples['completion'])
+
+        results = {'input_ids': [], 'attention_mask': [], 'labels': []}
+        for p_input, p_mask, c_input, c_mask in zip(prompt_tokens['input_ids'],
+                                                    prompt_tokens['attention_mask'],
+                                                    completion_tokens['input_ids'],
+                                                    completion_tokens['attention_mask']):
+            # concatenate prompt and completion tokens and attention masks
+            results['input_ids'].append(
+                (p_input + c_input[1:]  + [tokenizer.eos_token_id])[:cutoff_len]
+            )
+            results['attention_mask'].append(
+                (p_mask + c_mask[1:] + [1])[:cutoff_len]
+            )
+            # set tokens of the prompt to `IGNORED_LABEL_TOKEN_ID` in labels to avoid calculating loss
+            results['labels'].append(
+                ([-100] * len(p_input) + c_input[1:] + [tokenizer.eos_token_id])[:cutoff_len]
+            )
+        return results
+
+    tokenized_datasets = raw_datasets.map(
+        tokenize_function,
+        batched=True,
+        remove_columns=column_names,
+        load_from_cache_file=False,
+        desc="Running tokenizer on dataset",
+    )
+
+    train_data = tokenized_datasets["train"]
+    val_data = tokenized_datasets["validation"]
+    val_set_size = len(val_data)
 
     model = LlamaForCausalLM.from_pretrained(
         base_model,
@@ -113,57 +155,6 @@ def train(
         torch_dtype=torch.float16,
         device_map=device_map,
     )
-
-    tokenizer = LlamaTokenizer.from_pretrained(base_model)
-
-    tokenizer.pad_token_id = (
-        0  # unk. we want this to be different from the eos token
-    )
-    tokenizer.padding_side = "left"  # Allow batched inference
-
-    def tokenize(prompt, add_eos_token=True):
-        # there's probably a way to do this with the tokenizer settings
-        # but again, gotta move fast
-        result = tokenizer(
-            prompt,
-            truncation=True,
-            max_length=cutoff_len,
-            padding=False,
-            return_tensors=None,
-        )
-        if (
-            result["input_ids"][-1] != tokenizer.eos_token_id
-            and len(result["input_ids"]) < cutoff_len
-            and add_eos_token
-        ):
-            result["input_ids"].append(tokenizer.eos_token_id)
-            result["attention_mask"].append(1)
-
-        result["labels"] = result["input_ids"].copy()
-
-        return result
-
-    def generate_and_tokenize_prompt(data_point):
-        full_prompt = prompter.generate_prompt(
-            data_point["instruction"],
-            data_point["input"],
-            data_point["output"],
-        )
-        tokenized_full_prompt = tokenize(full_prompt)
-        if not train_on_inputs:
-            user_prompt = prompter.generate_prompt(
-                data_point["instruction"], data_point["input"]
-            )
-            tokenized_user_prompt = tokenize(user_prompt, add_eos_token=False)
-            user_prompt_len = len(tokenized_user_prompt["input_ids"])
-
-            tokenized_full_prompt["labels"] = [
-                -100
-            ] * user_prompt_len + tokenized_full_prompt["labels"][
-                user_prompt_len:
-            ]  # could be sped up, probably
-        return tokenized_full_prompt
-
     model = prepare_model_for_int8_training(model)
 
     config = LoraConfig(
@@ -175,11 +166,6 @@ def train(
         task_type="CAUSAL_LM",
     )
     model = get_peft_model(model, config)
-
-    if data_path.endswith(".json") or data_path.endswith(".jsonl"):
-        data = load_dataset("json", data_files=data_path)
-    else:
-        data = load_dataset(data_path)
 
     if resume_from_checkpoint:
         # Check the available weights and load them
@@ -203,20 +189,6 @@ def train(
 
     model.print_trainable_parameters()  # Be more transparent about the % of trainable params.
 
-    if val_set_size > 0:
-        train_val = data["train"].train_test_split(
-            test_size=val_set_size, shuffle=True, seed=42
-        )
-        train_data = (
-            train_val["train"].shuffle().map(generate_and_tokenize_prompt)
-        )
-        val_data = (
-            train_val["test"].shuffle().map(generate_and_tokenize_prompt)
-        )
-    else:
-        train_data = data["train"].shuffle().map(generate_and_tokenize_prompt)
-        val_data = None
-
     if not ddp and torch.cuda.device_count() > 1:
         # keeps Trainer from trying its own DataParallelism when more than 1 gpu is available
         model.is_parallelizable = True
@@ -229,23 +201,21 @@ def train(
         args=transformers.TrainingArguments(
             per_device_train_batch_size=micro_batch_size,
             gradient_accumulation_steps=gradient_accumulation_steps,
-            warmup_steps=100,
+            warmup_ratio=0.03,
+            lr_scheduler_type="cosine",
             num_train_epochs=num_epochs,
             learning_rate=learning_rate,
             fp16=True,
-            logging_steps=10,
+            logging_steps=1,
             optim="adamw_torch",
-            evaluation_strategy="steps" if val_set_size > 0 else "no",
-            save_strategy="steps",
-            eval_steps=200 if val_set_size > 0 else None,
-            save_steps=200,
+            evaluation_strategy="epoch" if val_set_size > 0 else "no",
+            save_strategy="epoch",
+            #eval_steps=200 if val_set_size > 0 else None,
+            #save_steps=200,
             output_dir=output_dir,
-            save_total_limit=3,
+            #save_total_limit=3,
             load_best_model_at_end=True if val_set_size > 0 else False,
             ddp_find_unused_parameters=False if ddp else None,
-            group_by_length=group_by_length,
-            report_to="wandb" if use_wandb else None,
-            run_name=wandb_run_name if use_wandb else None,
         ),
         data_collator=transformers.DataCollatorForSeq2Seq(
             tokenizer, pad_to_multiple_of=8, return_tensors="pt", padding=True
