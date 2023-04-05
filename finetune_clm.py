@@ -6,6 +6,7 @@ import fire
 import torch
 import transformers
 from datasets import load_dataset
+import evaluate
 
 """
 Unused imports:
@@ -24,6 +25,44 @@ from transformers import LlamaForCausalLM, LlamaTokenizer
 
 from utils.prompter import Prompter
 
+DEFAULT_GENERATION_CONFIG = {
+    "max_new_tokens": 256,
+    "do_sample": True,
+    "temperature": 0.1,
+    "top_k": 50,
+    "top_p": 1.0,
+    "repetition_penalty": 1.0
+}
+
+class LoRATrainer(transformers.Trainer):
+    def evaluate(
+        self,
+        eval_dataset = None,
+        ignore_keys = None,
+        metric_key_prefix: str = "eval",
+    ):
+
+        print(f"========= Evaluate @ {self.args.local_rank} - {len(self.eval_dataset)} =========")
+        completions = []
+        references = []
+        for d in self.eval_dataset:
+            prompt_len = (d["labels"] == -100).sum()
+            output = self.model.generate(d["input_ids"][:prompt_len], **DEFAULT_GENERATION_CONFIG)
+            completion = self.tokenizer.decode(output[0][prompt_len:], skip_special_tokens=True).strip()
+            reference = self.tokenizer.decode(d["labels"][prompt_len:], skip_special_tokens=True).strip()
+
+            print(self.tokenizer.decode(d["input_ids"][:prompt_len], skip_special_tokens=True))
+            print("\n------\n")
+            print(completion)
+            print("\n++++++\n")
+            print(reference)
+            print("\n^^^^^^\n")
+
+            completions.append(completion)
+            references.append(reference)
+
+        score = self.args.eval_metric.compute(predictions=completions, references=references)["score"]
+        return {metric_key_prefix + "_score" : score}
 
 def train(
     # model/data params
@@ -34,6 +73,7 @@ def train(
     # training hyperparams
     batch_size: int = 128,
     micro_batch_size: int = 4,
+    micro_eval_batch_size: int = 8,
     num_epochs: int = 3,
     learning_rate: float = 3e-4,
     cutoff_len: int = 256,
@@ -96,6 +136,8 @@ def train(
     if ddp:
         device_map = {"": int(os.environ.get("LOCAL_RANK") or 0)}
         gradient_accumulation_steps = gradient_accumulation_steps // world_size
+
+    eval_metric = evaluate.load("./pajm.py", completion_format="labeled")
 
     tokenizer_kwargs = {
         "model_max_length": cutoff_len,
@@ -194,29 +236,33 @@ def train(
         model.is_parallelizable = True
         model.model_parallel = True
 
-    trainer = transformers.Trainer(
+    training_args = transformers.TrainingArguments(
+        per_device_train_batch_size=micro_batch_size,
+        per_device_eval_batch_size=micro_eval_batch_size,
+        gradient_accumulation_steps=gradient_accumulation_steps,
+        warmup_ratio=0.03,
+        lr_scheduler_type="cosine",
+        num_train_epochs=num_epochs,
+        learning_rate=learning_rate,
+        fp16=True,
+        logging_steps=1,
+        optim="adamw_torch",
+        evaluation_strategy="epoch" if val_set_size > 0 else "no",
+        save_strategy="epoch",
+        #eval_steps=200 if val_set_size > 0 else None,
+        #save_steps=200,
+        output_dir=output_dir,
+        #save_total_limit=3,
+        load_best_model_at_end=True if val_set_size > 0 else False,
+        ddp_find_unused_parameters=False if ddp else None,
+    )
+    training_args.eval_metric = eval_metric
+    #trainer = transformers.Trainer(
+    trainer = LoRATrainer(
         model=model,
         train_dataset=train_data,
         eval_dataset=val_data,
-        args=transformers.TrainingArguments(
-            per_device_train_batch_size=micro_batch_size,
-            gradient_accumulation_steps=gradient_accumulation_steps,
-            warmup_ratio=0.03,
-            lr_scheduler_type="cosine",
-            num_train_epochs=num_epochs,
-            learning_rate=learning_rate,
-            fp16=True,
-            logging_steps=1,
-            optim="adamw_torch",
-            evaluation_strategy="epoch" if val_set_size > 0 else "no",
-            save_strategy="epoch",
-            #eval_steps=200 if val_set_size > 0 else None,
-            #save_steps=200,
-            output_dir=output_dir,
-            #save_total_limit=3,
-            load_best_model_at_end=True if val_set_size > 0 else False,
-            ddp_find_unused_parameters=False if ddp else None,
-        ),
+        args=training_args,
         data_collator=transformers.DataCollatorForSeq2Seq(
             tokenizer, pad_to_multiple_of=8, return_tensors="pt", padding=True
         ),

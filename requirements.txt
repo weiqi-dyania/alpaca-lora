@@ -1,5 +1,6 @@
-accelerate
+accelerate>=1.18.0
 appdirs
+evaluate
 loralib
 bitsandbytes
 black
