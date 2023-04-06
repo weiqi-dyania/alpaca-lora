@@ -1,5 +1,6 @@
 import os
 import sys
+import json
 from typing import List
 
 import fire
@@ -52,7 +53,14 @@ class LoRATrainer(transformers.Trainer):
                 refe = self.tokenizer.decode(label[pad_and_prompt_len:], skip_special_tokens=True)
                 predictions.append(pred)
                 references.append(refe)
+
         score = eval_metric.compute(predictions=predictions, references=references)["score"]
+        # save predictions
+        filename = f"predictions_{self.state.global_step}_{self.args.local_rank}.json"
+        filepath = os.path.join(self.args.output_dir, filename)
+        with open(filepath, "w") as f:
+            json.dump({"score": score, "predictions": predictions, "references": references}, f, indent=4)
+
         # a temporary hack to squeeze score into loss
         return (torch.tensor(1.0 - score).to(device), None, None)
 
