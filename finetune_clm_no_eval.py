@@ -34,6 +34,7 @@ def train(
     # training hyperparams
     batch_size: int = 128,
     micro_batch_size: int = 4,
+    micro_eval_batch_size: int = 8,
     num_epochs: int = 3,
     learning_rate: float = 3e-4,
     cutoff_len: int = 256,
@@ -68,6 +69,7 @@ def train(
             f"output_dir: {output_dir}\n"
             f"batch_size: {batch_size}\n"
             f"micro_batch_size: {micro_batch_size}\n"
+            f"micro_dev_batch_size: {micro_eval_batch_size}\n"
             f"num_epochs: {num_epochs}\n"
             f"learning_rate: {learning_rate}\n"
             f"cutoff_len: {cutoff_len}\n"
@@ -99,13 +101,13 @@ def train(
 
     tokenizer_kwargs = {
         "model_max_length": cutoff_len,
-        "padding_side": "left",
+        #"padding_side": "left",
         "use_fast": False,
     }
     tokenizer = LlamaTokenizer.from_pretrained(base_model, **tokenizer_kwargs)
-    tokenizer.pad_token_id = (
-        0  # unk. we want this to be different from the eos token
-    )
+    #tokenizer.pad_token_id = (
+    #    0  # unk. we want this to be different from the eos token
+    #)
 
 
     raw_datasets = load_dataset('json', data_files={"train": train_data_path, "validation": dev_data_path})
@@ -117,7 +119,7 @@ def train(
     def tokenize_function(examples):
         # tokenize prompt and completion separately
         prompt_tokens = tokenizer(examples['prompt'])
-        completion_tokens = tokenizer(examples['completion'])
+        completion_tokens = tokenizer(examples['completion'], add_special_tokens=False)
 
         results = {'input_ids': [], 'attention_mask': [], 'labels': []}
         for p_input, p_mask, c_input, c_mask in zip(prompt_tokens['input_ids'],
@@ -126,14 +128,14 @@ def train(
                                                     completion_tokens['attention_mask']):
             # concatenate prompt and completion tokens and attention masks
             results['input_ids'].append(
-                (p_input + c_input[1:]  + [tokenizer.eos_token_id])[:cutoff_len]
+                (p_input + c_input  + [tokenizer.eos_token_id])[:cutoff_len]
             )
             results['attention_mask'].append(
-                (p_mask + c_mask[1:] + [1])[:cutoff_len]
+                (p_mask + c_mask + [1])[:cutoff_len]
             )
             # set tokens of the prompt to `IGNORED_LABEL_TOKEN_ID` in labels to avoid calculating loss
             results['labels'].append(
-                ([-100] * len(p_input) + c_input[1:] + [tokenizer.eos_token_id])[:cutoff_len]
+                ([-100] * len(p_input) + c_input + [tokenizer.eos_token_id])[:cutoff_len]
             )
         return results
 
@@ -200,6 +202,7 @@ def train(
         eval_dataset=val_data,
         args=transformers.TrainingArguments(
             per_device_train_batch_size=micro_batch_size,
+            per_device_eval_batch_size=micro_eval_batch_size,
             gradient_accumulation_steps=gradient_accumulation_steps,
             warmup_ratio=0.03,
             lr_scheduler_type="cosine",
@@ -233,9 +236,14 @@ def train(
     if torch.__version__ >= "2" and sys.platform != "win32":
         model = torch.compile(model)
 
-    trainer.train(resume_from_checkpoint=resume_from_checkpoint)
+    train_result = trainer.train(resume_from_checkpoint=resume_from_checkpoint)
 
     model.save_pretrained(output_dir)
+    metrics = train_result.metrics
+    trainer.log_metrics("train", metrics)
+    trainer.save_metrics("train", metrics)
+    trainer.save_state()
+    tokenizer.save_pretrained(output_dir)
 
     print(
         "\n If there's a warning about missing keys above, please disregard :)"
